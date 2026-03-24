@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledgersys"
+version = "0.1.0"
+description = "Financial Ledger System"
+requires-python = ">=3.10"
+dependencies = [
+  "python-dotenv==1.0.1",
+]
+
+[project.scripts]
+trading = "trading.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
