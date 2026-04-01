@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routers import health
+from contextlib import asynccontextmanager
+from .routers import health, accounts, transactions
+from .db.db import init_db
 
 print("Welcome to the Ledger System!")
 
@@ -13,4 +15,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
 app.include_router(health.router)
+app.include_router(accounts.router)
+app.include_router(transactions.router)

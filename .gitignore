@@ -20,5 +20,8 @@ venv/
 .idea/
 
 #Data
+data/
 *.sqlite
 *.db
+*.sqlite-shm
+*.sqlite-wal

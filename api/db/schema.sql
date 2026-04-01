@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY,
-    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('deposit', 'withdrawal', 'transfer', 'payment', 'reversal')),
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('deposit', 'withdraw', 'transfer', 'payment', 'reversal')),
     reference TEXT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'posted', 'failed', 'reversed')),
     amount INTEGER NOT NULL CHECK (amount > 0),
