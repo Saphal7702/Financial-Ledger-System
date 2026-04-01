@@ -5,6 +5,100 @@ from ..db.db import connect
 from .helpers import generate_id, utc_now, make_request_hash
 from .audit_service import log_event
 
+def _insert_transaction(conn, transaction_id, transaction_type, status, amount, currency, idempotency_key, created_at) -> None:
+    conn.execute(
+            """
+            INSERT INTO transactions (
+                id, transaction_type, status, amount, currency, idempotency_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transaction_id,
+                transaction_type,
+                status,
+                amount,
+                currency,
+                idempotency_key,
+                created_at
+            )
+        )
+    
+def _insert_ledger_entry(conn, ledger_id, transaction_id, account_id, entry_type, amount, currency, created_at) -> None:
+    conn.execute(
+            """
+            INSERT INTO ledger_entries (
+                id, transaction_id, account_id, entry_type, amount, currency, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,(
+                ledger_id,
+                transaction_id,
+                account_id,
+                entry_type,
+                amount,
+                currency,
+                created_at
+            )
+        )
+    
+def _record_idempotency(conn, key, request_hash, transaction_id, status, created_at, updated_at) -> None:
+    conn.execute(
+            """
+            INSERT INTO idempotency_keys(
+                key, request_hash, transaction_id, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,(
+                key,
+                request_hash,
+                transaction_id,
+                status,
+                created_at,
+                updated_at
+            )
+        )
+    
+def _get_existing_idempotent_transaction(conn, idempotency_key):
+    return conn.execute(
+            """
+            SELECT request_hash, transaction_id FROM idempotency_keys where key=?
+            """,
+            (idempotency_key,),
+        ).fetchone()
+    
+def _load_system_cash_account(conn):
+    system_code = "SYSTEM_CASH_CLEARING"
+    return conn.execute(
+                """
+                SELECT id, currency, status from accounts where account_code=?
+                """,
+                (system_code, ),
+            ).fetchone()
+
+def _update_balance(conn, amount, account_id, action) -> None:
+    if action == 'add':
+        conn.execute(
+            """
+            UPDATE accounts SET current_balance = current_balance + ? WHERE id = ?
+            """,
+            (amount, account_id)
+        )
+    elif action == "sub":
+        conn.execute(
+            """
+            UPDATE accounts SET current_balance = current_balance - ? WHERE id = ?
+            """,
+            (amount, account_id)
+        )
+    else:
+        raise ValueError("Invalid balance update action")
+
+def _complete_transaction(conn, posted_at, id) -> None:
+    conn.execute(
+            """
+            UPDATE transactions SET status='posted', posted_at = ? WHERE id=?
+            """,
+            (posted_at, id)
+        )
+
 def deposit(req: DepositRequest) -> TransactionResponse:
     transaction_id = generate_id()
     time_stamp = utc_now()
@@ -13,8 +107,6 @@ def deposit(req: DepositRequest) -> TransactionResponse:
     ledger_id2 = generate_id()
 
     currency = req.currency.upper()
-
-    system_code = "SYSTEM_CASH_CLEARING"
 
     request_hash = make_request_hash({
         "type": "deposit",
@@ -28,12 +120,7 @@ def deposit(req: DepositRequest) -> TransactionResponse:
 
     with connect() as conn:
 
-        existing_idempotency = conn.execute(
-            """
-            SELECT request_hash, transaction_id FROM idempotency_keys where key=?
-            """,
-            (req.idempotency_key,),
-        ).fetchone()
+        existing_idempotency = _get_existing_idempotent_transaction(conn, req.idempotency_key)
 
         if existing_idempotency:
             if existing_idempotency["request_hash"] != request_hash:
@@ -50,12 +137,7 @@ def deposit(req: DepositRequest) -> TransactionResponse:
         if not dest_acc:
             raise HTTPException(status_code=404, detail="Destination account not found")
         
-        sys_acc = conn.execute(
-            """
-            SELECT id, currency, status from accounts where account_code=?
-            """,
-            (system_code, ),
-        ).fetchone()
+        sys_acc = _load_system_cash_account(conn)
 
         if not sys_acc:
             raise HTTPException(status_code=409, detail="System cash account not found")
@@ -72,90 +154,17 @@ def deposit(req: DepositRequest) -> TransactionResponse:
         if sys_acc["status"] != "active":
             raise HTTPException(status_code=409, detail="System account is not active")
 
-        conn.execute(
-            """
-            INSERT INTO transactions (
-                id, transaction_type, status, amount, currency, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transaction_id,
-                'deposit',
-                'pending',
-                req.amount,
-                currency,
-                req.idempotency_key,
-                time_stamp
-            )
-        )
+        _insert_transaction(conn, transaction_id, 'deposit', 'pending', req.amount, currency, req.idempotency_key, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,(
-                ledger_id1,
-                transaction_id,
-                req.account_id,
-                'debit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _insert_ledger_entry(conn, ledger_id1, transaction_id, req.account_id, 'debit', req.amount, currency, time_stamp)
+        _insert_ledger_entry(conn, ledger_id2, transaction_id, sys_acc["id"], 'credit', req.amount, currency, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,(
-                ledger_id2,
-                transaction_id,
-                sys_acc["id"],
-                'credit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _update_balance(conn, req.amount, req.account_id, 'add')
+        _update_balance(conn, req.amount, sys_acc["id"], 'sub')
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance + ? WHERE id = ?
-            """,
-            (req.amount, req.account_id)
-        )
+        _complete_transaction(conn, time_stamp, transaction_id)
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance - ? WHERE id = ?
-            """,
-            (req.amount, sys_acc["id"])
-        )
-
-        conn.execute(
-            """
-            UPDATE transactions SET status='posted', posted_at = ? WHERE id=?
-            """,
-            (time_stamp, transaction_id)
-        )
-
-        conn.execute(
-            """
-            INSERT INTO idempotency_keys(
-                key, request_hash, transaction_id, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,(
-                req.idempotency_key,
-                request_hash,
-                transaction_id,
-                'completed',
-                time_stamp,
-                time_stamp
-            )
-        )
+        _record_idempotency(conn, req.idempotency_key, request_hash, transaction_id,  'completed', time_stamp, time_stamp)
 
         log_event(
             conn=conn, 
@@ -180,8 +189,6 @@ def withdraw(req: WithdrawRequest) -> TransactionResponse:
 
     currency = req.currency.upper()
 
-    system_code = "SYSTEM_CASH_CLEARING"
-
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than 0")
     
@@ -193,12 +200,7 @@ def withdraw(req: WithdrawRequest) -> TransactionResponse:
     })
 
     with connect() as conn:
-        existing_idempotency = conn.execute(
-            """
-            SELECT request_hash, transaction_id FROM idempotency_keys WHERE key = ?
-            """,
-            (req.idempotency_key,),
-        ).fetchone()
+        existing_idempotency = _get_existing_idempotent_transaction(conn, req.idempotency_key)
 
         if existing_idempotency:
             if existing_idempotency["request_hash"] != request_hash:
@@ -224,12 +226,7 @@ def withdraw(req: WithdrawRequest) -> TransactionResponse:
         if dest_acc["status"] != "active":
             raise HTTPException(status_code=409, detail="Requested account is not active")
         
-        sys_acc = conn.execute(
-            """
-            SELECT id, currency, status FROM accounts WHERE account_code=?
-            """,
-            (system_code, ),
-        ).fetchone()
+        sys_acc = _load_system_cash_account(conn)
 
         if not sys_acc:
             raise HTTPException(status_code=404, detail="System account not found")
@@ -240,91 +237,17 @@ def withdraw(req: WithdrawRequest) -> TransactionResponse:
         if sys_acc["status"] != "active":
             raise HTTPException(status_code=409, detail="System account is not active")
         
-        conn.execute(
-            """
-            INSERT INTO transactions (
-                id, transaction_type, status, amount, currency, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transaction_id,
-                'withdraw',
-                'pending',
-                req.amount,
-                currency,
-                req.idempotency_key,
-                time_stamp
-            )
-        )
+        _insert_transaction(conn, transaction_id, 'withdraw', 'pending', req.amount, currency, req.idempotency_key, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ledger_id1,
-                transaction_id,
-                req.account_id,
-                'credit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _insert_ledger_entry(conn, ledger_id1, transaction_id, req.account_id, 'credit', req.amount, currency, time_stamp)
+        _insert_ledger_entry(conn, ledger_id2, transaction_id, sys_acc["id"], 'debit', req.amount, currency, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,(
-                ledger_id2,
-                transaction_id,
-                sys_acc["id"],
-                'debit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _update_balance(conn, req.amount, req.account_id, 'sub')
+        _update_balance(conn, req.amount, sys_acc["id"], 'add')
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance - ? WHERE id = ?
-            """,
-            (req.amount, req.account_id)
-        )
+        _complete_transaction(conn, time_stamp, transaction_id)
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance + ? WHERE id = ?
-            """,
-            (req.amount, sys_acc["id"])
-        )
-
-        conn.execute(
-            """
-            UPDATE transactions SET status='posted', posted_at = ? WHERE id=?
-            """,
-            (time_stamp, transaction_id)
-        )
-
-        conn.execute(
-            """
-            INSERT INTO idempotency_keys(
-                key, request_hash, transaction_id, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,(
-                req.idempotency_key,
-                request_hash,
-                transaction_id,
-                'completed',
-                time_stamp,
-                time_stamp
-            )
-        )
+        _record_idempotency(conn, req.idempotency_key, request_hash, transaction_id,  'completed', time_stamp, time_stamp)
 
         log_event(
             conn=conn, 
@@ -364,12 +287,7 @@ def transfer(req: TransferRequest) -> TransactionResponse:
     })
 
     with connect() as conn:
-        existing_idempotency = conn.execute(
-            """
-            SELECT transaction_id, request_hash FROM idempotency_keys WHERE key=?
-            """,
-            (req.idempotency_key,),
-        ).fetchone()
+        existing_idempotency = _get_existing_idempotent_transaction(conn, req.idempotency_key)
 
         if existing_idempotency:
             if existing_idempotency["request_hash"] != request_hash:
@@ -411,92 +329,17 @@ def transfer(req: TransferRequest) -> TransactionResponse:
         if dest_acc["currency"] != currency:
             raise HTTPException(status_code=400, detail="Destination account currency mismatch")
         
-        conn.execute(
-            """
-            INSERT INTO transactions (
-                id, transaction_type, status, amount, currency, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transaction_id,
-                'transfer',
-                'pending',
-                req.amount,
-                currency,
-                req.idempotency_key,
-                time_stamp
-            )
-        )
+        _insert_transaction(conn, transaction_id, 'transfer', 'pending', req.amount, currency, req.idempotency_key, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ledger_id1,
-                transaction_id,
-                req.from_account_id,
-                'credit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _insert_ledger_entry(conn, ledger_id1, transaction_id, req.from_account_id, 'credit', req.amount, currency, time_stamp)
+        _insert_ledger_entry(conn, ledger_id2, transaction_id, req.to_account_id, 'debit', req.amount, currency, time_stamp)
 
-        conn.execute(
-            """
-            INSERT INTO ledger_entries (
-                id, transaction_id, account_id, entry_type, amount, currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ledger_id2,
-                transaction_id,
-                req.to_account_id,
-                'debit',
-                req.amount,
-                currency,
-                time_stamp
-            )
-        )
+        _update_balance(conn, req.amount, source_acc["id"], 'sub')
+        _update_balance(conn, req.amount, dest_acc["id"], 'add')
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance - ? WHERE id=?
-            """,
-            (req.amount, source_acc["id"])
-        )
+        _complete_transaction(conn, time_stamp, transaction_id)
 
-        conn.execute(
-            """
-            UPDATE accounts SET current_balance = current_balance + ? WHERE id=?
-            """,
-            (req.amount, dest_acc["id"])
-        )
-
-        conn.execute(
-            """
-            UPDATE transactions SET status = 'posted', posted_at = ? WHERE id=?
-            """,
-            (time_stamp, transaction_id)
-        )
-
-        conn.execute(
-            """
-            INSERT INTO idempotency_keys(
-                key, request_hash, transaction_id, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,(
-                req.idempotency_key,
-                request_hash,
-                transaction_id,
-                'completed',
-                time_stamp,
-                time_stamp
-            )
-        )
+        _record_idempotency(conn, req.idempotency_key, request_hash, transaction_id,  'completed', time_stamp, time_stamp)
 
         log_event(
             conn=conn, 
@@ -538,16 +381,28 @@ def get_transaction(transaction_id: str) -> TransactionResponse:
         posted_at=row["posted_at"]
     )
 
-def get_transaction_entires(transaction_id: str) -> list[LedgerEntryResponse]:
+def get_transaction_entries(transaction_id: str) -> list[LedgerEntryResponse]:
     entries_list = []
 
     with connect() as conn:
+
+        tx = conn.execute(
+            "SELECT id FROM transactions WHERE id = ?",
+            (transaction_id,),
+        ).fetchone()
+
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
         rows = conn.execute(
             """
             SELECT * FROM ledger_entries WHERE transaction_id=? ORDER BY created_at DESC
             """,
             (transaction_id, ),
         ).fetchall()
+
+        if not rows:
+            return []
 
         for row in rows:
             entries_list.append(

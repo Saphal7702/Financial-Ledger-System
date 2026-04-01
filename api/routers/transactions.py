@@ -23,4 +23,4 @@ def get_transaction(transaction_id: str):
 
 @router.get("/{transaction_id}/entries", response_model=list[LedgerEntryResponse])
 def get_transaction_entries(transaction_id: str):
-    return transaction_service.get_transaction_entires(transaction_id)
+    return transaction_service.get_transaction_entries(transaction_id)
