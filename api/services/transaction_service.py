@@ -1,16 +1,16 @@
-from ..schemas.transaction import DepositRequest, WithdrawRequest, TransferRequest, TransactionResponse
+from ..schemas.transaction import DepositRequest, WithdrawRequest, TransferRequest, TransactionResponse, ReverseTransactionRequest
 from ..schemas.ledger import LedgerEntryResponse
 from fastapi import HTTPException
 from ..db.db import connect
 from .helpers import generate_id, utc_now, make_request_hash
 from .audit_service import log_event
 
-def _insert_transaction(conn, transaction_id, transaction_type, status, amount, currency, idempotency_key, created_at) -> None:
+def _insert_transaction(conn, transaction_id, transaction_type, status, amount, currency, idempotency_key, created_at,reversal_of_transaction_id=None) -> None:
     conn.execute(
             """
             INSERT INTO transactions (
-                id, transaction_type, status, amount, currency, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, transaction_type, status, amount, currency, idempotency_key, created_at, reversal_of_transaction_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 transaction_id,
@@ -19,7 +19,8 @@ def _insert_transaction(conn, transaction_id, transaction_type, status, amount, 
                 amount,
                 currency,
                 idempotency_key,
-                created_at
+                created_at,
+                reversal_of_transaction_id
             )
         )
     
@@ -91,12 +92,12 @@ def _update_balance(conn, amount, account_id, action) -> None:
     else:
         raise ValueError("Invalid balance update action")
 
-def _complete_transaction(conn, posted_at, id) -> None:
+def _complete_transaction(conn, posted_at, transaction_id) -> None:
     conn.execute(
             """
             UPDATE transactions SET status='posted', posted_at = ? WHERE id=?
             """,
-            (posted_at, id)
+            (posted_at, transaction_id)
         )
 
 def deposit(req: DepositRequest) -> TransactionResponse:
@@ -356,6 +357,87 @@ def transfer(req: TransferRequest) -> TransactionResponse:
 
     return get_transaction(transaction_id)
 
+def reverse_transaction(transaction_id: str, req: ReverseTransactionRequest) -> TransactionResponse:
+
+    reverse_transaction_id = generate_id()
+    time_stamp = utc_now()
+
+    request_hash = make_request_hash({
+        "type": "reverse_transaction",
+        "transaction_id": transaction_id
+    })
+
+    og_trans = get_transaction(transaction_id)
+
+    if og_trans.status != "posted":
+            raise HTTPException(status_code=409, detail="Only posted transactions can be reversed")
+
+    if og_trans.transaction_type == "reversal":
+        raise HTTPException(status_code=409, detail="Reversal transactions cannot be reversed")
+
+    with connect() as conn:
+
+        verify_reversal = conn.execute(
+            """
+            SELECT id FROM transactions WHERE reversal_of_transaction_id=?
+            """,
+            (transaction_id,),
+        ).fetchone()
+
+        if verify_reversal:
+            return get_transaction(verify_reversal["id"])
+
+        existing_idempotency = _get_existing_idempotent_transaction(conn, req.idempotency_key)
+
+        if existing_idempotency:
+            if existing_idempotency["request_hash"] != request_hash:
+                raise HTTPException(status_code=409, detail="Idempotency key reuse with different request payload")
+            return get_transaction(existing_idempotency["transaction_id"])
+        
+        _insert_transaction(conn, reverse_transaction_id, 'reversal', 'pending', og_trans.amount, og_trans.currency, req.idempotency_key, time_stamp, transaction_id)
+
+        ledger_entries = conn.execute(
+            """
+            SELECT * FROM ledger_entries WHERE transaction_id = ?
+            """,
+            (og_trans.id, ),
+        ).fetchall()
+
+        if not ledger_entries:
+            raise HTTPException(status_code=409, detail="Ledger entries not found")
+        
+        for entry in ledger_entries:
+            ledger_id = generate_id()
+            if entry["entry_type"] == 'credit':
+                reverse_entry_type = 'debit'
+                update_balance = 'add'
+            elif entry["entry_type"] == 'debit':
+                reverse_entry_type = 'credit'
+                update_balance = 'sub'
+
+            _insert_ledger_entry(conn, ledger_id, reverse_transaction_id, entry["account_id"], reverse_entry_type, entry["amount"], entry["currency"], time_stamp)
+            _update_balance(conn, entry["amount"], entry["account_id"], update_balance)
+
+        _complete_transaction(conn, time_stamp, reverse_transaction_id)
+
+        _record_idempotency(conn, req.idempotency_key, request_hash, reverse_transaction_id, 'completed', time_stamp, time_stamp)
+
+        log_event(
+            conn=conn,
+            entity_type="transaction",
+            entity_id=reverse_transaction_id,
+            action="transaction_reversed",
+            metadata={
+                "original_transaction_id": transaction_id,
+                "reversal_transaction_id": reverse_transaction_id,
+                "amount": og_trans.amount,
+                "currency": og_trans.currency,
+            },
+        )
+        
+
+    return get_transaction(reverse_transaction_id)
+
 def get_transaction(transaction_id: str) -> TransactionResponse:
     with connect() as conn:
         row = conn.execute(
@@ -378,7 +460,8 @@ def get_transaction(transaction_id: str) -> TransactionResponse:
         description=row["description"],
         idempotency_key=row["idempotency_key"],
         created_at=row["created_at"],
-        posted_at=row["posted_at"]
+        posted_at=row["posted_at"],
+        reversal_of_transaction_id=row["reversal_of_transaction_id"]
     )
 
 def get_transaction_entries(transaction_id: str) -> list[LedgerEntryResponse]:

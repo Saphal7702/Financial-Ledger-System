@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from ..schemas.transaction import DepositRequest, WithdrawRequest, TransferRequest, TransactionResponse
+from ..schemas.transaction import DepositRequest, WithdrawRequest, TransferRequest, TransactionResponse, ReverseTransactionRequest
 from ..schemas.ledger import LedgerEntryResponse
 from ..services import transaction_service
 
@@ -24,3 +24,7 @@ def get_transaction(transaction_id: str):
 @router.get("/{transaction_id}/entries", response_model=list[LedgerEntryResponse])
 def get_transaction_entries(transaction_id: str):
     return transaction_service.get_transaction_entries(transaction_id)
+
+@router.post("/{transaction_id}/reverse", response_model=TransactionResponse, status_code=201)
+def reverse_trans(transaction_id: str, req: ReverseTransactionRequest):
+    return transaction_service.reverse_transaction(transaction_id, req)

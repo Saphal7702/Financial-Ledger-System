@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     description TEXT NULL,
     idempotency_key TEXT NULL,
     created_at TEXT NOT NULL,
-    posted_at TEXT NULL
+    posted_at TEXT NULL,
+    reversal_of_transaction_id TEXT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ledger_entries (

@@ -31,3 +31,7 @@ class TransactionResponse(BaseModel):
     idempotency_key: str | None = None
     created_at: str
     posted_at: str | None = None
+    reversal_of_transaction_id: str | None = None
+
+class ReverseTransactionRequest(BaseModel):
+    idempotency_key: str
